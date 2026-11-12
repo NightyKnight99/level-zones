@@ -1,0 +1,10 @@
+## Interface: 16001
+## Title: Level Zones
+## Notes: Outdoor zone advice and dungeon quest checklists for WoW Forever.
+## Version: 0.2.7
+## SavedVariables: LevelZonesCatalogDB
+## SavedVariablesPerCharacter: LevelZonesDB
+
+LocalCatalog.lua
+Engine.lua
+LevelZones.lua
