@@ -1,9 +1,14 @@
 local _, Addon = ...
 
-local FORMAT = 1
+local FORMAT = 3
 local EMPTY = {}
+local FOREVER_ZONE_AREAS = {
+    16591, -- Riverglades
+    16593, -- Zephras Isle
+    16651, -- Shen'dralas
+}
 local CITY_MAPS = { [1453] = true, [1454] = true, [1455] = true, [1456] = true, [1457] = true, [1458] = true }
-local QUEST_FIELDS = { 1, 2, 3, 4, 5, 6, 7, 10, 12, 13, 16, 17, 18, 19, 20, 21, 22, 24, 25, 27, 30, 31, 32, 33, 34, 35, 36 }
+local QUEST_FIELDS = { 1, 2, 3, 4, 5, 6, 7, 10, 12, 13, 16, 17, 18, 19, 20, 21, 22, 24, 25, 27, 30, 31, 32, 33, 34, 35, 36, 9 }
 local GATES = {
     [9] = "all", [10] = "any", [11] = "exclusive", [17] = "next", [19] = "parent",
     [20] = "breadcrumb", [23] = "max", [24] = "untilQuest", [25] = "starting", [27] = "disabled",
@@ -129,11 +134,11 @@ local function importCatalog(provider, journal)
     local maps = areaMaps(provider)
     if not next(maps) then error("QuestieDB did not expose its Forever map data.") end
     local foreverMaps = {}
-    for _, area in ipairs({ 16591, 16593 }) do
+    for _, area in ipairs(FOREVER_ZONE_AREAS) do
         if maps[area] then foreverMaps[maps[area]] = true end
     end
     local dungeons, assigned = dungeonIndex(journal)
-    local quests, npcCache, objectCache = {}, {}, {}
+    local quests, npcCache, objectCache, itemCache = {}, {}, {}, {}
     local function npc(id)
         if not npcCache[id] then
             local fields = provider.Npc.GetAll(id, { 1, 4, 5, 6, 7, 13 }) or EMPTY
@@ -148,6 +153,47 @@ local function importCatalog(provider, journal)
             objectCache[id] = { name = fields[1], points = coordinates(fields[2], maps, foreverMaps) }
         end
         return objectCache[id]
+    end
+    local function addMaps(result, points)
+        for _, point in ipairs(points) do
+            if outdoorMap(point.map, foreverMaps) then result[point.map] = true end
+        end
+    end
+    local function item(id)
+        if not itemCache[id] then
+            local fields = provider.Item and provider.Item.GetAll and provider.Item.GetAll(id, { 1, 2, 3 }) or EMPTY
+            local result = {}
+            for _, source in ipairs(fields[2] or EMPTY) do addMaps(result, npc(source).points) end
+            for _, source in ipairs(fields[3] or EMPTY) do addMaps(result, object(source).points) end
+            itemCache[id] = { name = fields[1], maps = result }
+        end
+        return itemCache[id]
+    end
+    local objectiveSources = { { "monster", npc }, { "object", object }, { "item", item } }
+    local function objectiveLocations(data, trigger)
+        local result
+        for index, source in ipairs(objectiveSources) do
+            for _, objective in ipairs((data and data[index]) or EMPTY) do
+                if objective[1] then
+                    local entity = source[2](objective[1])
+                    local locations = entity.maps or {}
+                    if entity.points then addMaps(locations, entity.points) end
+                    result = result or {}
+                    local kind = source[1]
+                    result[kind] = result[kind] or {}
+                    table.insert(result[kind], { name = entity.name, text = objective[2], maps = locations })
+                end
+            end
+        end
+        if trigger and trigger[2] then
+            local locations = {}
+            addMaps(locations, coordinates(trigger[2], maps, foreverMaps))
+            if next(locations) then
+                result = result or {}
+                result.event = { { text = trigger[1], maps = locations } }
+            end
+        end
+        return result
     end
 
     local outdoorCount = 0
@@ -174,6 +220,7 @@ local function importCatalog(provider, journal)
             local repeatable = (row[18] or 0) % 2 == 1
             if outdoorMap(map, foreverMaps) and not assigned[id] and start and not repeatable then
                 quest.map = map
+                quest.objectives = objectiveLocations(row[8], row[28])
                 outdoorCount = outdoorCount + 1
                 for _, objective in ipairs((row[8] and row[8][1]) or EMPTY) do
                     if objective[1] then
@@ -207,17 +254,25 @@ end
 function Addon.EnsureLocalCatalog(rebuild, inform, openPanel)
     if importRunning then inform("The local quest catalog is still building.") return end
     local saved = LevelZonesCatalogDB
-    if not rebuild and type(saved) == "table" and saved.format == FORMAT
+    local savedReady = type(saved) == "table" and (saved.format == FORMAT or saved.format == 2 or saved.format == 1)
         and type(saved.quests) == "table" and next(saved.quests)
-        and type(saved.dungeons) == "table" and #saved.dungeons >= 3 and type(saved.foreverMaps) == "table" then
+        and type(saved.dungeons) == "table" and #saved.dungeons >= 3 and type(saved.foreverMaps) == "table"
+    local function openSaved()
         if Addon.quests ~= saved.quests then activate(saved) end
         openPanel()
+    end
+    if savedReady and saved.format == FORMAT and not rebuild then
+        openSaved()
         return
     end
     local provider = LibQuestieDB
     local journal = ForeverDungeonJournal_NS and ForeverDungeonJournal_NS.DB
     if not provider or not provider.Quest or not provider.Quest.GetAll or not provider.Quest.GetAllIds
         or not provider.Npc or not provider.Object or type(journal) ~= "table" then
+        if savedReady and not rebuild then
+            openSaved()
+            return
+        end
         inform("For the first catalog build, enable QuestieDB and DungeonJournal for WoW Forever, then log in again.")
         return
     end
@@ -229,6 +284,7 @@ function Addon.EnsureLocalCatalog(rebuild, inform, openPanel)
         if not ok then
             importRunning = false
             inform("Catalog build failed: " .. tostring(snapshot))
+            if savedReady and not rebuild then openSaved() end
         elseif coroutine.status(task) == "dead" then
             importRunning = false
             LevelZonesCatalogDB = snapshot

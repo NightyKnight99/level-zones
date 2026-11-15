@@ -10,4 +10,6 @@ Drag the bar at the bottom of the panel to change its height. The top and sides 
 
 The catalog is stored account-wide in WoW's saved variables. The panel position, skipped dungeons and zone preference are stored per character. To refresh the catalog after a source update, enable both source addons and type **`/lvlzones rebuild`**.
 
+When updating to 0.3.0, log in once with QuestieDB and DungeonJournal enabled so the catalog can import objective locations. Log out normally to save the updated catalog.
+
 The ZIP contains addon source and setup instructions. WoW does the setup through its addon API. Quest recommendations are estimates and may miss server-side requirements or quest changes.

@@ -11,6 +11,7 @@ local minimapButton
 local updatePending
 local worldUpdatePending
 local snapshot
+local stableChoice
 local startupRequested = false
 local zoneExpanded = false
 local rows = {}
@@ -73,7 +74,10 @@ local function hidePanel()
     if _G.LevelZonesSettings then _G.LevelZonesSettings:Hide() end
     snapshot = nil
     turnedIn = {}
-    for _, row in ipairs(rows) do row.button:SetScript("OnClick", nil) end
+    for _, row in ipairs(rows) do
+        row.button:SetScript("OnClick", nil)
+        if row.check then row.check:SetScript("OnClick", nil) end
+    end
 end
 
 local function info(map)
@@ -118,16 +122,33 @@ local function questLog()
         if entry and not entry.isHeader and entry.questID then
             local ready = false
             if C_QuestLog.IsComplete then ready = C_QuestLog.IsComplete(entry.questID) end
-            active[entry.questID] = { ready = ready == true or ready == 1, title = entry.title }
+            local quest = { ready = ready == true or ready == 1, title = entry.title }
+            local catalog = Addon.quests[entry.questID]
+            if not quest.ready and catalog and catalog.objectives and C_QuestLog.GetQuestObjectives then
+                for _, objective in ipairs(C_QuestLog.GetQuestObjectives(entry.questID) or {}) do
+                    if not objective.finished and objective.type and objective.type ~= "log" then
+                        quest.objectives = quest.objectives or {}
+                        local text = (objective.text or ""):gsub("[:%s]*%d+%s*/%s*%d+%s*$", "")
+                        quest.objectives[#quest.objectives + 1] = { kind = objective.type, text = text }
+                    end
+                end
+            end
+            active[entry.questID] = quest
         end
     end
     return active
 end
 
+local noObjectives = {}
 local function sameQuestLog(previous, current)
     for id, quest in pairs(previous) do
         local other = current[id]
         if not other or quest.ready ~= other.ready or quest.title ~= other.title then return false end
+        local before, after = quest.objectives or noObjectives, other.objectives or noObjectives
+        if #before ~= #after then return false end
+        for index, objective in ipairs(before) do
+            if objective.kind ~= after[index].kind or objective.text ~= after[index].text then return false end
+        end
     end
     for id in pairs(current) do
         if not previous[id] then return false end
@@ -199,6 +220,15 @@ local function pinDescription(pin)
         mapName(pin.map), pin.x, pin.y)
 end
 
+local function viewZone(map)
+    if InCombatLockdown() then
+        message("Open " .. mapName(map) .. " after combat.")
+    elseif WorldMapFrame and WorldMapFrame.SetMapID then
+        WorldMapFrame:Show()
+        WorldMapFrame:SetMapID(map)
+    end
+end
+
 local function showPin(pin)
     if InCombatLockdown() then
         message(pinDescription(pin))
@@ -259,7 +289,7 @@ local function newRow()
     return row
 end
 
-local function line(text, style, buttonText, callback, indent)
+local function line(text, style, buttonText, callback, indent, checked)
     rowCount = rowCount + 1
     local row = rows[rowCount]
     if not row then
@@ -273,7 +303,12 @@ local function line(text, style, buttonText, callback, indent)
         row.label:ClearAllPoints()
         row.label:SetPoint("TOPLEFT", row, "TOPLEFT", offset, -3)
     end
-    local color = (useInk and ink or colors)[style or "normal"]
+    local font = style == "zoneTitle" and GameFontNormalLarge or GameFontHighlight
+    if font and row.font ~= font then
+        row.label:SetFontObject(font)
+        row.font, row.measure = font, true
+    end
+    local color = (useInk and ink or colors)[style == "zoneTitle" and "gold" or style or "normal"]
     if row.color ~= color then
         row.color = color
         row.label:SetTextColor(unpack(color))
@@ -291,8 +326,23 @@ local function line(text, style, buttonText, callback, indent)
         row.button:SetScript("OnClick", nil)
         row.button:Hide()
     end
-    if (row.buttonText == nil) ~= (buttonText == nil) then row.measure = true end
     row.buttonText = buttonText
+    if checked ~= nil then
+        if not row.check then
+            row.check = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
+            row.check:SetSize(24, 24)
+            row.check:SetPoint("TOPRIGHT", -5, 0)
+        end
+        row.check:SetChecked(checked)
+        row.check:SetScript("OnClick", callback)
+        row.check:Show()
+    elseif row.check then
+        row.check:SetScript("OnClick", nil)
+        row.check:Hide()
+    end
+    local controlWidth = buttonText and 110 or (checked ~= nil and 34 or 0)
+    if row.controlWidth ~= controlWidth then row.measure = true end
+    row.controlWidth = controlWidth
     row:Show()
 end
 
@@ -317,13 +367,13 @@ local function reflow(contentChanged)
                 row:ClearAllPoints()
                 row:SetPoint("TOPLEFT", frame.body, "TOPLEFT", 0, -y)
             end
-            local labelWidth = math.max(55, width - row.indent - (row.buttonText and 110 or 6))
+            local labelWidth = math.max(55, width - row.indent - math.max(6, row.controlWidth))
             if row.labelWidth ~= labelWidth then
                 row.labelWidth, row.measure = labelWidth, true
                 row.label:SetWidth(labelWidth)
             end
             if row.measure then
-                row.height = math.max(row.buttonText and 24 or 18, math.ceil(row.label:GetStringHeight()) + 7)
+                row.height = math.max(row.controlWidth > 0 and 24 or 18, math.ceil(row.label:GetStringHeight()) + 7)
                 row:SetHeight(row.height)
                 row.measure = nil
             end
@@ -356,63 +406,89 @@ local function reflow(contentChanged)
     if current > maxScroll then frame.scroll:SetVerticalScroll(maxScroll) end
 end
 
+local function zoneWork(bucket)
+    local parts = {}
+    if bucket.objectives > 0 then
+        parts[#parts + 1] = bucket.objectives .. (bucket.objectives == 1 and " objective left" or " objectives left")
+    elseif bucket.active > 0 then
+        parts[#parts + 1] = bucket.active .. " in your log"
+    end
+    if bucket.ready > 0 then parts[#parts + 1] = bucket.ready .. " to pick up" end
+    if bucket.turnin > 0 then parts[#parts + 1] = bucket.turnin .. " to turn in" end
+    if #parts == 0 and bucket.unlocks and bucket.unlocks > 0 then
+        return questCount(bucket.unlocks) .. " behind a prequest"
+    end
+    return table.concat(parts, " · ")
+end
+
 local function outdoorRows(ctx, result)
     local here, nextZone = result.current, result.choices[1]
+    local db = settings()
     local zone = ctx.map and mapName(ctx.map) or (GetRealZoneText() or "Your area")
-    local heading, detail
-    if result.advice == "wrap" then
-        heading = "Wrap up " .. zone
-        if here.turnin > 0 then
-            detail = questCount(here.turnin) .. " ready to turn in here."
-        elseif here.active > 0 then
-            detail = questCount(here.active) .. " in your log still fit your level."
-        end
-    elseif result.advice == "move" then
-        heading = "Head to " .. mapName(nextZone.map)
-        detail = questCount(nextZone.ready) .. " you can look for now" ..
-            (nextZone.active > 0 and (", plus " .. questCount(nextZone.active) .. " in your log.") or ".")
-    elseif result.advice == "stay" then
-        heading = "Keep questing in " .. zone
-        detail = questCount(here.ready) .. " to pick up · " .. here.active .. " in your log"
-    else
-        heading = "No strong outdoor suggestion"
-        detail = "Try again after you change zones or level up."
-    end
+    local moving = result.advice == "move"
+    local unsure = result.advice == "unsure"
+    local action = moving and "Head there now" or (result.advice == "wrap" and "Wrap up here" or "Stay here")
     pendingGap = 5
-    line(heading, "gold", zoneExpanded and "Less" or "Details", function()
+    line("Best zone right now", "muted", zoneExpanded and "Less" or "Details", function()
         zoneExpanded = not zoneExpanded
         refresh()
     end, 11)
-    if detail then line(detail, "normal", nil, nil, 11) end
+    line(unsure and "No clear pick" or (moving and mapName(nextZone.map) or zone), "zoneTitle", nil, nil, 11)
+    if not unsure then
+        local work = zoneWork(moving and nextZone or here)
+        line(action .. (work ~= "" and (" · " .. work) or ""), "normal", nil, nil, 11)
+    end
+    if nextZone and not moving and not unsure then
+        line("After that: " .. mapName(nextZone.map), "muted", nil, nil, 11)
+    end
     if nextZone and nextZone.unlockQuest and (result.advice == "wrap" or zoneExpanded) then
         line(nameOf(nextZone.unlockQuest) .. " can open " .. questCount(nextZone.unlocks) ..
             " in " .. mapName(nextZone.map) .. ".", "muted", nil, nil, 11)
-    elseif nextZone and result.advice == "wrap" then
-        line("Next: " .. mapName(nextZone.map) .. " · " .. nextZone.ready .. " to pick up", "muted", nil, nil, 11)
     end
     zoneEnd = rowCount
     if not zoneExpanded then return end
     local first = rowCount + 1
     useInk = true
+    if nextZone then
+        line((moving and "Why this zone?" or "Up next") .. "\n" .. mapName(nextZone.map), "gold", "View Zone",
+            function() viewZone(nextZone.map) end)
+        local work = zoneWork(nextZone)
+        local canSkip = not db.skippedZone
+        line(work, "normal", canSkip and "Skip for now", canSkip and function()
+            db.skippedZone, db.skippedZoneLevel = nextZone.map, ctx.level
+            stableChoice, snapshot.outdoor = nil, nil
+            refresh()
+        end)
+    end
+    if db.skippedZone then
+        line(mapName(db.skippedZone) .. " skipped until Lv " .. (ctx.level + 1), "muted", "Undo", function()
+            db.skippedZone, db.skippedZoneLevel = nil, nil
+            stableChoice, snapshot.outdoor = nil, nil
+            refresh()
+        end)
+    end
     if here.nearby > 0 then line(questCount(here.nearby) .. " start near you.", "muted") end
     if here.enemyMin and here.enemyMax then
         line(string.format("Quest enemies here: levels %d–%d", here.enemyMin, here.enemyMax), "muted")
     end
     if here.groups > 0 then line(here.groups .. " tougher or group quests nearby.", "muted") end
     if here.returnLevel then line("Check this zone again around level " .. here.returnLevel .. ".", "muted") end
-    for index = 1, math.min(3, #result.choices) do
+    for index = 2, math.min(3, #result.choices) do
         local candidate = result.choices[index]
-        if candidate.ready + candidate.active > 0 then
-            local levels = candidate.minLevel and string.format(" · Lv %d–%d", candidate.minLevel, candidate.maxLevel) or ""
-            local active = candidate.active > 0 and (" · " .. candidate.active .. " in log") or ""
-            line(mapName(candidate.map) .. " · " .. candidate.ready .. " to pick up" .. active .. levels, "normal")
-        end
+        local levels = candidate.minLevel and string.format(" · Lv %d–%d", candidate.minLevel, candidate.maxLevel) or ""
+        line(mapName(candidate.map) .. levels .. "\n" .. zoneWork(candidate) ..
+            " · " .. Engine.ZoneAlternativeReason(nextZone, candidate), "normal")
     end
-    line("Prefer new Forever zones", "muted", settings().preferForever and "On" or "Off", function()
-        settings().preferForever = not settings().preferForever
-        snapshot.outdoor = nil
+    if result.upcoming then
+        line(mapName(result.upcoming.map) .. " · Quests around Lv " .. result.upcoming.futureLevel, "muted")
+    end
+    local prefersForever = not not db.preferForever
+    local priorityText = prefersForever and "New Forever zone priority: ACTIVE" or "New Forever zone priority: OFF"
+    line(priorityText, "normal", nil, function(check)
+        db.preferForever = check:GetChecked()
+        stableChoice, snapshot.outdoor = nil, nil
         refresh()
-    end)
+    end, nil, prefersForever)
     line("Panel size", "muted", "Adjust", showSettings)
     useInk = false
     paper(first)
@@ -431,20 +507,32 @@ end
 local function dungeonSummary(result, ctx)
     local groups = result.groups
     local active, pickup, turnin = groupCount(groups, "active"), groupCount(groups, "pickup"), groupCount(groups, "turnin")
-    if turnin > 0 then return questCount(turnin) .. " ready to turn in" end
+    local inside, locked, check = groupCount(groups, "inside"), groupCount(groups, "locked"), groupCount(groups, "check")
+    local nearby = 0
     for _, item in ipairs(groups.pickup or {}) do
         local entry = item.entry
         local pin = entry.pin or (Addon.quests[entry.id] or {}).start
         if pin and pin.map == ctx.map and ctx.x and (ctx.x - pin.x) ^ 2 + (ctx.y - pin.y) ^ 2 <= 225 then
-            return nameOf(entry.id, entry.name) .. " available nearby"
+            nearby = nearby + 1
         end
     end
-    if ctx.level < result.dungeon.min then return "Better around level " .. result.dungeon.min end
-    if pickup > 0 then return active .. " in your log · " .. pickup .. " to pick up" end
-    if active > 0 then return "Good time for a run · " .. active .. " in your log" end
-    if groups.inside then return groupCount(groups, "inside") .. " quests start inside" end
-    if groups.locked then return "Prequest needed" end
-    return "Check quest requirements"
+    local parts = {}
+    if ctx.level < result.dungeon.min then
+        parts[#parts + 1] = "Better at Lv " .. result.dungeon.min
+    elseif not result.lower and turnin + pickup + locked + check == 0 and active + inside > 0 then
+        parts[#parts + 1] = "Ready to run"
+    end
+    if turnin > 0 then parts[#parts + 1] = turnin .. " to turn in" end
+    if active > 0 then parts[#parts + 1] = active .. " in your log" end
+    if pickup > 0 then
+        parts[#parts + 1] = pickup .. " to pick up" .. (nearby > 0 and (" (" .. nearby .. " nearby)") or "")
+    end
+    if locked > 0 then parts[#parts + 1] = locked .. " locked" end
+    if inside > 0 then parts[#parts + 1] = inside .. (inside == 1 and " starts inside" or " start inside") end
+    if check > 0 then parts[#parts + 1] = check .. " to check" end
+    if #parts > 0 then return table.concat(parts, " · ") end
+    if groups.later then return #groups.later .. " higher-level" end
+    return "Listed quests completed"
 end
 
 local function questRow(ctx, item, state)
@@ -484,7 +572,6 @@ local function questRow(ctx, item, state)
 end
 
 local function dungeonRows(ctx, results)
-    if results and #results == 0 then return end
     pendingGap = 6
     local db = settings()
     line("Dungeons", "gold", db.dungeonsHidden and "Show all" or "Hide all", function()
@@ -492,6 +579,11 @@ local function dungeonRows(ctx, results)
         refresh()
     end)
     if not results then return end
+    line("Lower-level dungeons", "muted", db.showLowerDungeons and "Hide lower" or "Show lower", function()
+        db.showLowerDungeons = not db.showLowerDungeons
+        snapshot.dungeons = nil
+        refresh()
+    end)
     for _, result in ipairs(results) do
         local name = result.dungeon.name
         if result.skipped then
@@ -502,7 +594,8 @@ local function dungeonRows(ctx, results)
             end)
         else
             local opened = openedDungeons[name]
-            line(name .. "\n" .. dungeonSummary(result, ctx), "normal", opened and "Collapse" or "Quests", function()
+            local range = string.format(" · Lv %d–%d", result.dungeon.min, result.dungeon.max)
+            line(name .. range .. "\n" .. dungeonSummary(result, ctx), "normal", opened and "Collapse" or "Quests", function()
                 openedDungeons[name] = not openedDungeons[name]
                 refresh()
             end)
@@ -535,6 +628,8 @@ refresh = function(requery, active)
         snapshot = { ctx = context(active), titles = {}, inDungeon = inInstance and (kind == "party" or kind == "raid") }
     end
     local ctx = snapshot.ctx
+    local db = settings()
+    if db.skippedZoneLevel ~= ctx.level then db.skippedZone, db.skippedZoneLevel = nil, nil end
     local faction = ctx.faction or "Horde"
     frame.crest:SetTexture("Interface\\TargetingFrame\\UI-PVP-" .. faction)
     if faction == "Alliance" then
@@ -555,19 +650,26 @@ refresh = function(requery, active)
         line("Outdoor suggestions resume when you leave.", "muted", nil, nil, 11)
         zoneEnd = rowCount
     else
-        if not snapshot.outdoor then snapshot.outdoor = Engine.Outdoor(ctx, settings().preferForever) end
+        if not snapshot.outdoor then
+            local previousMap = stableChoice and stableChoice.level == ctx.level and stableChoice.map == ctx.map
+                and stableChoice.destination
+            snapshot.outdoor = Engine.Outdoor(ctx, db.preferForever, db.skippedZone, previousMap)
+            local choice = snapshot.outdoor.choices[1]
+            stableChoice = choice and { level = ctx.level, map = ctx.map, destination = choice.map }
+        end
         outdoorRows(ctx, snapshot.outdoor)
     end
-    local db = settings()
     local dungeons
     if not db.dungeonsHidden then
-        if not snapshot.dungeons then snapshot.dungeons = Engine.Dungeons(ctx, db.skipped) end
+        if not snapshot.dungeons then snapshot.dungeons = Engine.Dungeons(ctx, db.skipped, db.showLowerDungeons) end
         dungeons = snapshot.dungeons
     end
     dungeonRows(ctx, dungeons)
     for index = rowCount + 1, previousRows do
-        rows[index].button:SetScript("OnClick", nil)
-        rows[index]:Hide()
+        local row = rows[index]
+        row.button:SetScript("OnClick", nil)
+        if row.check then row.check:SetScript("OnClick", nil) end
+        row:Hide()
     end
     for index = paperCount + 1, previousPaper do paperStrips[index]:Hide() end
     reflow(true)

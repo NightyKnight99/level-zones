@@ -2,6 +2,8 @@
 
 A free World of Warcraft Forever addon that suggests leveling zones and shows which dungeon quests you can still pick up.
 
+The main panel shows the best zone now and where to go afterward. Open **Details** to see why, view the zone on the world map, or skip it until you level up. Dungeon rows show a level range and quest status. **Show lower** reveals older dungeons.
+
 ## Install
 
 Download the extract-only ZIP under **Releases**.

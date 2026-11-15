@@ -118,7 +118,7 @@ end
 local function bucketFor(buckets, map)
     if not buckets[map] then
         buckets[map] = { map = map, ready = 0, active = 0, turnin = 0, groups = 0, unlocks = 0,
-            nearby = 0, hubs = {}, cluster = 0 }
+            nearby = 0, objectives = 0, hubs = {}, cluster = 0 }
     end
     return buckets[map]
 end
@@ -144,7 +144,76 @@ local function addPickup(bucket, quest, ctx)
     end
 end
 
-function Engine.Outdoor(ctx, preferForever)
+local zoneScoreReasons = {
+    "Fewer quests to pick up at your level",
+    "Fewer relevant quests already in your log",
+    "Quest pickups are more spread out",
+    "Fewer quests open after your current prequests",
+    "New Forever zones have priority",
+    "Longer estimated trip",
+}
+
+function Engine.ZoneAlternativeReason(best, alternative)
+    if best.score - alternative.score < .001 then return "Similar fit" end
+    local reason, largest = "Similar fit", 0
+    for index, label in ipairs(zoneScoreReasons) do
+        local difference = best.factors[index] - alternative.factors[index]
+        if difference > largest then reason, largest = label, difference end
+    end
+    return reason
+end
+
+local function objectiveDestination(ctx, quest, objective)
+    local candidates = quest.objectives and quest.objectives[objective.kind]
+    if not candidates then return nil end
+    local matched
+    if #candidates == 1 then
+        matched = candidates[1]
+    else
+        local text = objective.text:lower()
+        local longest = 0
+        for _, candidate in ipairs(candidates) do
+            for _, key in ipairs({ "name", "text" }) do
+                local label = candidate[key]
+                if type(label) == "string" and label ~= "" and text:find(label:lower(), 1, true) then
+                    if #label > longest then
+                        matched, longest = candidate, #label
+                    elseif #label == longest and matched ~= candidate then
+                        matched = nil
+                    end
+                end
+            end
+        end
+    end
+    local maps = matched and matched.maps
+    if not maps then return nil end
+    if ctx.map and maps[ctx.map] then return ctx.map end
+    if maps[quest.map] then return quest.map end
+    local nearest, cost
+    for map in pairs(maps) do
+        if ctx.isZone(map) then
+            local travel = ctx.travelCost(map)
+            if not nearest or travel < cost or (travel == cost and map < nearest) then nearest, cost = map, travel end
+        end
+    end
+    return nearest
+end
+
+local function addActive(ctx, buckets, quest, active, suitable)
+    local counted = {}
+    for _, objective in ipairs(active.objectives or empty) do
+        local map = objectiveDestination(ctx, quest, objective)
+        local bucket = bucketFor(buckets, map or quest.map)
+        if map and suitable then bucket.objectives = bucket.objectives + 1 end
+        counted[bucket] = true
+    end
+    if not next(counted) then counted[bucketFor(buckets, quest.map)] = true end
+    for bucket in pairs(counted) do
+        if suitable then bucket.active = bucket.active + 1 else bucket.groups = bucket.groups + 1 end
+    end
+end
+
+function Engine.Outdoor(ctx, preferForever, skippedMap, previousMap)
     local buckets = {}
     local localBucket = ctx.map and bucketFor(buckets, ctx.map)
     local currentLevel = ctx.level
@@ -160,20 +229,21 @@ function Engine.Outdoor(ctx, preferForever)
                 local bucket = bucketFor(buckets, map)
                 bucket.turnin = bucket.turnin + 1
             elseif state == "active" then
-                local bucket = bucketFor(buckets, quest.map)
-                if suitable and not quest.elite and level >= currentLevel - 6 then
-                    bucket.active = bucket.active + 1
-                else
-                    bucket.groups = bucket.groups + 1
-                end
+                addActive(ctx, buckets, quest, ctx.active[id], suitable and not quest.elite and level >= currentLevel - 6)
             elseif state == "pickup" and suitable then
                 local bucket = bucketFor(buckets, quest.map)
                 if quest.elite then bucket.groups = bucket.groups + 1
                 else addPickup(bucket, quest, ctx) end
-            elseif (state == "later" or state == "pickup") and not suitable and quest.map == ctx.map then
-                local at = math.max(quest.min, level - 3)
+            elseif state == "later" or (state == "pickup" and not suitable) then
+                local at = math.max(quest.min, level - 3, (quest.enemyMax or level) - 5)
                 if at > currentLevel then
-                    localBucket.returnLevel = math.min(localBucket.returnLevel or at, at)
+                    if quest.map == ctx.map then
+                        localBucket.returnLevel = math.min(localBucket.returnLevel or at, at)
+                    elseif Addon.foreverMaps[quest.map] then
+                        local bucket = bucketFor(buckets, quest.map)
+                        local questLevel = math.max(quest.min, level)
+                        bucket.futureLevel = math.min(bucket.futureLevel or questLevel, questLevel)
+                    end
                 end
             elseif state == "locked" and suitable and localBucket and quest.map ~= ctx.map then
                 local prequest = quests[gate]
@@ -196,22 +266,42 @@ function Engine.Outdoor(ctx, preferForever)
         end
     end
 
-    local choices = {}
+    local choices, upcoming = {}, nil
     for map, bucket in pairs(buckets) do
-        if map ~= ctx.map and ctx.isZone(map) and (bucket.ready + bucket.active > 0 or bucket.unlocks > 0) then
+        if map ~= ctx.map and map ~= skippedMap and ctx.isZone(map)
+            and (bucket.ready + bucket.active > 0 or bucket.unlocks > 0) then
             local travel = ctx.travelCost(map)
             local foreverBonus = preferForever and Addon.foreverMaps[map] and 2 or 0
-            bucket.score = math.min(bucket.ready, 14) + bucket.active * 1.6 + math.min(bucket.cluster, 5) * 0.7
-                + math.min(bucket.unlocks, 4) * 0.45 + foreverBonus - travel
+            bucket.factors = {
+                math.min(bucket.ready, 14), bucket.active * 1.6, math.min(bucket.cluster, 5) * 0.7,
+                math.min(bucket.unlocks, 4) * 0.45, foreverBonus, -travel,
+            }
+            bucket.score = 0
+            for _, points in ipairs(bucket.factors) do bucket.score = bucket.score + points end
             choices[#choices + 1] = bucket
+        elseif map ~= ctx.map and map ~= skippedMap and bucket.futureLevel and ctx.travelCost(map) < 5
+            and (not upcoming or bucket.futureLevel < upcoming.futureLevel
+                or (bucket.futureLevel == upcoming.futureLevel and map < upcoming.map)) then
+            upcoming = bucket
         end
     end
     table.sort(choices, function(a, b)
         if a.score == b.score then return a.map < b.map end
         return a.score > b.score
     end)
+    -- Keep a useful recommendation through small quest-log changes.
+    if previousMap and choices[1] and choices[1].map ~= previousMap then
+        for index = 2, #choices do
+            local candidate = choices[index]
+            if candidate.map == previousMap and candidate.ready + candidate.active > 0
+                and choices[1].score - candidate.score < 2 then
+                table.insert(choices, 1, table.remove(choices, index))
+                break
+            end
+        end
+    end
 
-    local here = localBucket or { ready = 0, active = 0, turnin = 0, nearby = 0, groups = 0 }
+    local here = localBucket or { ready = 0, active = 0, turnin = 0, nearby = 0, groups = 0, objectives = 0 }
     local nextZone = choices[1]
     local localWork = here.ready + here.active
     local advice = "stay"
@@ -224,17 +314,19 @@ function Engine.Outdoor(ctx, preferForever)
     elseif localWork == 0 then
         advice = nextZone and nextZone.ready + nextZone.active > 0 and "move" or "unsure"
     end
-    return { advice = advice, current = here, choices = choices }
+    return { advice = advice, current = here, choices = choices, upcoming = upcoming }
 end
 
-function Engine.Dungeons(ctx, skipped)
+function Engine.Dungeons(ctx, skipped, showLower)
     local result = {}
     for _, dungeon in ipairs(Addon.dungeons) do
         local isSkipped = skipped[dungeon.name]
-        local inRange = ctx.level >= dungeon.min - 3 and ctx.level <= dungeon.max + 1
+        local lower = ctx.level > dungeon.max + 1
+        local inRange = ctx.level >= dungeon.min - 3 and not lower
+        local browseLower = lower and showLower == true
         local distance = math.abs(ctx.level - dungeon.min)
         if isSkipped then
-            result[#result + 1] = { dungeon = dungeon, skipped = true, distance = distance }
+            result[#result + 1] = { dungeon = dungeon, skipped = true, distance = distance, browseOnly = false }
         else
             local inLog = false
             if not inRange then
@@ -242,7 +334,7 @@ function Engine.Dungeons(ctx, skipped)
                     if ctx.active[entry.id] then inLog = true break end
                 end
             end
-            if inRange or inLog then
+            if inRange or inLog or browseLower then
                 local groups, pending = {}, 0
                 for _, entry in ipairs(dungeon.quests) do
                     local state, gate = Engine.State(ctx, entry.id, entry)
@@ -252,13 +344,15 @@ function Engine.Dungeons(ctx, skipped)
                         if state ~= "complete" and state ~= "later" then pending = pending + 1 end
                     end
                 end
-                if groups.active or groups.turnin or (inRange and pending > 0) then
-                    result[#result + 1] = { dungeon = dungeon, groups = groups, distance = distance, inRange = inRange }
+                if groups.active or groups.turnin or (inRange and pending > 0) or (browseLower and next(groups)) then
+                    result[#result + 1] = { dungeon = dungeon, groups = groups, distance = distance,
+                        inRange = inRange, lower = lower, browseOnly = browseLower and not inLog }
                 end
             end
         end
     end
     table.sort(result, function(a, b)
+        if a.browseOnly ~= b.browseOnly then return not a.browseOnly end
         if a.distance == b.distance then return a.dungeon.name < b.dungeon.name end
         return a.distance < b.distance
     end)
